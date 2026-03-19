@@ -1,9 +1,4 @@
 //! Iroh resolver primitives for AT Protocol records.
-//!
-//! This crate exposes a small resolver that:
-//! - parses `at://` URIs,
-//! - fetches records using [`atrium_api`], and
-//! - packages responses with iroh node metadata.
 
 use atrium_api::{
     client::AtpServiceClient,
@@ -12,6 +7,7 @@ use atrium_api::{
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use iroh::PublicKey;
+use n0_future::boxed::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -129,6 +125,22 @@ impl AtriumIrohResolver {
             value,
             resolved_by: self.node_id,
         })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AtProtoResolver {}
+
+impl iroh::address_lookup::AddressLookup for AtProtoResolver {
+    fn publish(&self, _data: &iroh::endpoint_info::EndpointData) {}
+
+    fn resolve(
+        &self,
+        _endpoint_id: iroh::EndpointId,
+    ) -> Option<
+        BoxStream<std::result::Result<iroh::address_lookup::Item, iroh::address_lookup::Error>>,
+    > {
+        None
     }
 }
 

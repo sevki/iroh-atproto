@@ -1692,6 +1692,7 @@ dependencies = [
  "atrium-xrpc",
  "atrium-xrpc-client",
  "iroh",
+ "n0-future",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
