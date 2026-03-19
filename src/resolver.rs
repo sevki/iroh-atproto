@@ -1,3 +1,7 @@
+//! [`AtProtoResolver`] — iroh [`AddressLookup`] backed by AT Protocol DID documents.
+//!
+//! [`AddressLookup`]: iroh::address_lookup::AddressLookup
+
 use std::sync::Arc;
 
 use atrium_api::did_doc::DidDocument;
@@ -7,76 +11,114 @@ use atrium_identity::{
     did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig},
 };
-use iroh::EndpointAddr;
+use iroh::{
+    EndpointId,
+    address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item},
+};
+use n0_future::boxed::BoxStream;
 
 use crate::dns::HickoryDnsTxtResolver;
-use crate::error::{Error, Result};
 use crate::http::ReqwestHttpClient;
 use crate::service::{IROH_SERVICE_TYPE, SERVICE_ID, parse_service_endpoint};
 
-/// Configuration for [`AtprotoIrohResolver`].
+const PROVENANCE: &str = "atproto";
+
+/// Configuration for [`AtProtoResolver`].
 #[derive(Clone, Debug)]
-pub struct AtprotoIrohResolverConfig {
+pub struct AtProtoResolverConfig {
+    /// The AT Protocol handle or DID whose DID document this resolver manages.
+    ///
+    /// - For **resolve**: the DID document belonging to this identity is fetched
+    ///   and its `IrohNode` service entry is returned when the stored
+    ///   [`EndpointId`] matches the requested one.
+    /// - For **publish**: updating a live PLC operation requires a rotation key
+    ///   or PLC access token, which is out of scope here; `publish` is a no-op.
+    pub at_identifier: String,
+
     /// URL of the PLC directory to use for `did:plc` resolution.
     ///
     /// Defaults to `https://plc.directory/`.
     pub plc_directory_url: String,
 }
 
-impl Default for AtprotoIrohResolverConfig {
-    fn default() -> Self {
+impl AtProtoResolverConfig {
+    /// Creates a new config for the given AT Protocol handle or DID.
+    pub fn new(at_identifier: impl Into<String>) -> Self {
         Self {
+            at_identifier: at_identifier.into(),
             plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_string(),
         }
     }
 }
 
-/// Resolves an AT Protocol handle or DID to an iroh [`EndpointAddr`].
+/// An iroh [`AddressLookup`] that resolves iroh node addresses via AT Protocol DID documents.
 ///
-/// Given an AT Protocol identity (handle like `alice.bsky.social` or a DID like
-/// `did:plc:xyz`), this resolver:
+/// ## How it works
 ///
-/// 1. Fetches the DID document via AT Protocol (DNS TXT + PLC directory / `did:web`).
-/// 2. Looks for a service entry with `"type": "IrohNode"` and `"id": "#iroh"`.
-/// 3. Parses the `serviceEndpoint` as `iroh://<node-id>` (optionally with
-///    `?relay=<relay-url>`) to produce an [`EndpointAddr`].
+/// An iroh endpoint publishes its addressing information into an AT Protocol DID
+/// document under a custom `IrohNode` service entry (see [`crate::service`]).
+/// Other peers that know the AT Protocol handle or DID of the endpoint can then
+/// resolve its iroh [`EndpointAddr`] without needing an out-of-band address exchange.
 ///
-/// # Adding an iroh node to a DID document
+/// ### Registering with an iroh endpoint
 ///
-/// In your PLC operation or `did:web` document, add a service:
+/// ```no_run
+/// use iroh::{Endpoint, endpoint::presets};
+/// use iroh_atproto::{AtProtoResolver, AtProtoResolverConfig};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let resolver = AtProtoResolver::new(AtProtoResolverConfig::new("alice.bsky.social"))?;
+/// let ep = Endpoint::builder(presets::N0)
+///     .address_lookup(resolver)
+///     .bind()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### DID document service entry format
+///
+/// Add this service to the AT Protocol DID document that peers should look up:
 ///
 /// ```json
 /// {
 ///   "id": "#iroh",
 ///   "type": "IrohNode",
-///   "serviceEndpoint": "iroh://<node-id>"
+///   "serviceEndpoint": "iroh://<node-id-hex>"
 /// }
 /// ```
 ///
-/// where `<node-id>` is the hex-encoded iroh public key, and an optional
-/// `?relay=<url>` query parameter can be included to advertise a relay URL.
+/// with an optional relay URL:
 ///
-/// # Example
-///
-/// ```no_run
-/// use iroh_atproto::{AtprotoIrohResolver, AtprotoIrohResolverConfig};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let resolver = AtprotoIrohResolver::new(Default::default())?;
-/// let addr = resolver.resolve("alice.bsky.social").await?;
-/// println!("iroh node id: {}", addr.id);
-/// # Ok(())
-/// # }
+/// ```json
+/// { "serviceEndpoint": "iroh://<node-id-hex>?relay=https%3A%2F%2Frelay.example.com" }
 /// ```
-pub struct AtprotoIrohResolver {
+///
+/// [`AddressLookup`]: iroh::address_lookup::AddressLookup
+/// [`EndpointAddr`]: iroh::EndpointAddr
+pub struct AtProtoResolver {
+    at_identifier: String,
     did_resolver: Arc<CommonDidResolver<ReqwestHttpClient>>,
     handle_resolver: Arc<AtprotoHandleResolver<HickoryDnsTxtResolver, ReqwestHttpClient>>,
 }
 
-impl AtprotoIrohResolver {
-    /// Creates a new [`AtprotoIrohResolver`] with the given configuration.
+impl std::fmt::Debug for AtProtoResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtProtoResolver")
+            .field("at_identifier", &self.at_identifier)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AtProtoResolver {
+    /// Creates a new [`AtProtoResolver`] with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`hickory_resolver::ResolveError`] if the DNS resolver cannot be
+    /// initialised from the system configuration.
     pub fn new(
-        config: AtprotoIrohResolverConfig,
+        config: AtProtoResolverConfig,
     ) -> std::result::Result<Self, hickory_resolver::ResolveError> {
         let http_client = Arc::new(ReqwestHttpClient::new());
         let dns_txt_resolver = HickoryDnsTxtResolver::new()?;
@@ -85,59 +127,114 @@ impl AtprotoIrohResolver {
             plc_directory_url: config.plc_directory_url,
             http_client: http_client.clone(),
         }));
-
         let handle_resolver = Arc::new(AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
             dns_txt_resolver,
             http_client,
         }));
 
         Ok(Self {
+            at_identifier: config.at_identifier,
             did_resolver,
             handle_resolver,
         })
     }
+}
 
-    /// Resolves an AT Protocol handle or DID to an iroh [`EndpointAddr`].
+impl AddressLookup for AtProtoResolver {
+    /// Publishes the local endpoint's addressing information to AT Protocol.
     ///
-    /// The DID document must contain a service entry with `"type": "IrohNode"` and
-    /// `"id": "#iroh"`. The `serviceEndpoint` must follow the format
-    /// `iroh://<node-id>` (with optional `?relay=<relay-url>`).
-    pub async fn resolve(&self, at_identifier: &str) -> Result<EndpointAddr> {
-        // 1. Determine the DID string from the input.
-        let did_str = match at_identifier
-            .parse::<AtIdentifier>()
-            .map_err(|e| atrium_identity::Error::AtIdentifier(e.to_string()))?
-        {
-            AtIdentifier::Did(did) => did.as_str().to_string(),
-            AtIdentifier::Handle(handle) => {
-                let did = self.handle_resolver.resolve(&handle).await?;
-                did.as_str().to_string()
+    /// **Note**: Updating a live AT Protocol DID document (PLC operation) requires
+    /// the account's rotation key or a PLC client credential, which is not held by
+    /// this resolver.  This method is intentionally a no-op — DID document updates
+    /// must be performed out-of-band (e.g. via the Bluesky app or a PLC client).
+    fn publish(&self, _data: &EndpointData) {
+        // Updating a live AT Protocol DID document requires the account's rotation
+        // key or PLC client credentials, which are not available to this resolver.
+        // DID document updates must be performed out-of-band.
+    }
+
+    /// Resolves an iroh [`EndpointId`] to its addressing information via AT Protocol.
+    ///
+    /// Fetches the DID document for the configured AT Protocol identity and returns
+    /// the [`EndpointAddr`] stored in the `IrohNode` service entry, **provided** the
+    /// stored node ID matches `endpoint_id`.
+    ///
+    /// [`EndpointAddr`]: iroh::EndpointAddr
+    fn resolve(&self, endpoint_id: EndpointId) -> Option<BoxStream<Result<Item, Error>>> {
+        let at_identifier = self.at_identifier.clone();
+        let did_resolver = self.did_resolver.clone();
+        let handle_resolver = self.handle_resolver.clone();
+
+        let fut = async move {
+            // 1. Resolve the AT Protocol handle or DID to a canonical DID string.
+            let did_str = resolve_to_did(&handle_resolver, &at_identifier)
+                .await
+                .map_err(|e| Error::from_err_box(PROVENANCE, Box::new(e)))?;
+
+            // 2. Fetch the DID document.
+            let did = did_str.parse().map_err(|e| {
+                Error::from_err_box(
+                    PROVENANCE,
+                    Box::<dyn std::error::Error + Send + Sync>::from(
+                        format!("invalid DID `{did_str}`: {e}"),
+                    ),
+                )
+            })?;
+            let doc: DidDocument = did_resolver
+                .resolve(&did)
+                .await
+                .map_err(|e| Error::from_err_box(PROVENANCE, Box::new(e)))?;
+
+            // 3. Extract the IrohNode service entry.
+            let endpoint_addr = extract_iroh_addr(&doc, &at_identifier)
+                .map_err(|e| Error::from_err_box(PROVENANCE, Box::new(e)))?;
+
+            // 4. Return the address only when the stored EndpointId matches.
+            // If the DID document belongs to a different iroh node, this resolver
+            // has no results for the requested endpoint_id.
+            if endpoint_addr.id != endpoint_id {
+                return Err(n0_error::e!(Error::NoResults));
             }
+
+            Ok(Item::new(EndpointInfo::from(endpoint_addr), PROVENANCE, None))
         };
 
-        // 2. Fetch the DID document.
-        let did = did_str
-            .parse()
-            .map_err(|e| atrium_identity::Error::Did(format!("invalid DID `{did_str}`: {e}")))?;
-        let doc = self.did_resolver.resolve(&did).await?;
+        Some(Box::pin(n0_future::stream::once_future(fut)))
+    }
+}
 
-        // 3. Extract the IrohNode service endpoint.
-        extract_iroh_addr(&doc, at_identifier)
+/// Resolves the AT Protocol handle or DID to a DID string.
+async fn resolve_to_did(
+    handle_resolver: &AtprotoHandleResolver<HickoryDnsTxtResolver, ReqwestHttpClient>,
+    at_identifier: &str,
+) -> std::result::Result<String, atrium_identity::Error> {
+    match at_identifier
+        .parse::<AtIdentifier>()
+        .map_err(|e| atrium_identity::Error::AtIdentifier(e.to_string()))?
+    {
+        AtIdentifier::Did(did) => Ok(did.as_str().to_string()),
+        AtIdentifier::Handle(handle) => {
+            let did = handle_resolver.resolve(&handle).await?;
+            Ok(did.as_str().to_string())
+        }
     }
 }
 
 /// Extracts an iroh [`EndpointAddr`] from the `IrohNode` service entry in a DID document.
-pub(crate) fn extract_iroh_addr(doc: &DidDocument, identity: &str) -> Result<EndpointAddr> {
+///
+/// [`EndpointAddr`]: iroh::EndpointAddr
+pub(crate) fn extract_iroh_addr(
+    doc: &DidDocument,
+    identity: &str,
+) -> crate::error::Result<iroh::EndpointAddr> {
     let services = doc.service.as_deref().unwrap_or_default();
-
-    // Accept either `#iroh` or `<did>#iroh` as the service id.
     let full_id = format!("{}#{}", doc.id, SERVICE_ID.trim_start_matches('#'));
     let service = services.iter().find(|svc| {
         (svc.id == SERVICE_ID || svc.id == full_id) && svc.r#type == IROH_SERVICE_TYPE
     });
 
     let Some(service) = service else {
-        return Err(Error::NoIrohService(identity.to_string()));
+        return Err(crate::error::Error::NoIrohService(identity.to_string()));
     };
 
     parse_service_endpoint(&service.service_endpoint)

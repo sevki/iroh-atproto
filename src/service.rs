@@ -100,6 +100,7 @@ pub fn format_service_endpoint(addr: &EndpointAddr) -> String {
 /// Minimal percent-encoding for relay URLs: encodes all bytes that are not
 /// unreserved characters per RFC 3986 (A-Z a-z 0-9 - _ . ~).
 fn percent_encode(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
@@ -108,7 +109,8 @@ fn percent_encode(input: &str) -> String {
             }
             other => {
                 out.push('%');
-                out.push_str(&format!("{other:02X}"));
+                out.push(HEX[(other >> 4) as usize] as char);
+                out.push(HEX[(other & 0xf) as usize] as char);
             }
         }
     }

@@ -1639,6 +1639,8 @@ dependencies = [
  "atrium-xrpc",
  "hickory-resolver",
  "iroh",
+ "n0-error",
+ "n0-future",
  "reqwest",
  "serde",
  "serde_json",
