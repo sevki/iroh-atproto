@@ -3,7 +3,7 @@ name = "iroh-atproto"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Iroh resolver over AT Protocol"
+description = "Resolve iroh nodes via AT Protocol DID documents"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sevki/iroh-atproto"
 keywords = ["iroh", "atproto", "bluesky", "resolver", "p2p"]
@@ -11,7 +11,7 @@ keywords = ["iroh", "atproto", "bluesky", "resolver", "p2p"]
 [dependencies]
 # Iroh P2P connectivity
 iroh = "0.97.0"
-# AT Protocol identity resolution
+# AT Protocol identity and DID document resolution
 atrium-api = { version = "0.25.7", default-features = false }
 atrium-identity = "0.1.8"
 atrium-common = "0.1.3"

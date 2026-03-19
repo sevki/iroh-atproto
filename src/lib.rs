@@ -1,165 +1,144 @@
 //! # iroh-atproto
 //!
-//! An [iroh] P2P resolver for [AT Protocol] identities.
+//! Resolve [iroh] nodes via [AT Protocol] DID documents.
 //!
-//! This crate provides:
+//! Given an AT Protocol handle (e.g. `alice.bsky.social`) or DID (e.g.
+//! `did:plc:xyz`), this crate fetches the DID document through the standard AT
+//! Protocol resolution pipeline and extracts the iroh node information from a
+//! well-known service entry.
 //!
-//! - [`AtprotoProtocol`] — an iroh [`ProtocolHandler`] that resolves AT Protocol handles
-//!   and DIDs on behalf of peers that connect over the [`ALPN`] protocol.
-//! - [`AtprotoClient`] — a client that connects to an [`AtprotoProtocol`] node over iroh
-//!   and requests handle or DID resolution.
+//! ## DID document format
 //!
-//! ## Protocol
+//! Add a service entry to your PLC operation or `did:web` document:
 //!
-//! The custom ALPN identifier is [`ALPN`] (`/atproto/resolve/1`).  A client opens a
-//! bi-directional QUIC stream, writes a JSON [`ResolveRequest`], and receives a JSON
-//! [`ResolveResponse`] back.
-//!
-//! ## Quick-start
-//!
-//! ### Server
-//!
-//! ```no_run
-//! use iroh::{Endpoint, endpoint::presets};
-//! use iroh::protocol::Router;
-//! use iroh_atproto::{AtprotoProtocol, ALPN};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let endpoint = Endpoint::bind(presets::N0).await?;
-//!     let protocol = AtprotoProtocol::new(Default::default())?;
-//!     let router = Router::builder(endpoint)
-//!         .accept(ALPN, protocol)
-//!         .spawn();
-//!     tokio::signal::ctrl_c().await?;
-//!     router.shutdown().await?;
-//!     Ok(())
+//! ```json
+//! {
+//!   "id": "#iroh",
+//!   "type": "IrohNode",
+//!   "serviceEndpoint": "iroh://<node-id>"
 //! }
 //! ```
 //!
-//! ### Client
+//! `<node-id>` is the lowercase hex-encoded iroh public key (64 hex characters).
+//! An optional relay URL can be appended as `?relay=<percent-encoded-relay-url>`:
+//!
+//! ```json
+//! {
+//!   "serviceEndpoint": "iroh://a3b1c2...?relay=https%3A%2F%2Frelay.example.com"
+//! }
+//! ```
+//!
+//! ## Example
 //!
 //! ```no_run
-//! use iroh::{Endpoint, EndpointAddr, endpoint::presets};
-//! use iroh_atproto::AtprotoClient;
+//! use iroh_atproto::{AtprotoIrohResolver, AtprotoIrohResolverConfig};
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let endpoint = Endpoint::bind(presets::N0).await?;
-//!     let server_addr: EndpointAddr = todo!("obtain from server");
-//!     let client = AtprotoClient::new(endpoint);
-//!     let identity = client.resolve_handle(&server_addr, "alice.bsky.social").await?;
-//!     println!("DID:  {}", identity.did);
-//!     println!("PDS:  {}", identity.pds);
-//!     Ok(())
-//! }
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let resolver = AtprotoIrohResolver::new(Default::default())?;
+//! let addr = resolver.resolve("alice.bsky.social").await?;
+//! println!("node id: {}", addr.id);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! [iroh]: https://iroh.computer
 //! [AT Protocol]: https://atproto.com
-//! [`ProtocolHandler`]: iroh::protocol::ProtocolHandler
 
-mod client;
 mod dns;
 mod error;
-mod handler;
 mod http;
-mod proto;
+mod resolver;
+pub mod service;
 
-pub use client::{AtprotoClient, ResolvedIdentity};
 pub use error::{Error, Result};
-pub use handler::{AtprotoProtocol, AtprotoProtocolConfig};
-pub use proto::{ALPN, ResolveRequest, ResolveResponse};
+pub use resolver::{AtprotoIrohResolver, AtprotoIrohResolverConfig};
+pub use service::{IROH_SERVICE_TYPE, SERVICE_ID, format_service_endpoint, parse_service_endpoint};
 
 #[cfg(test)]
 mod tests {
+    use atrium_api::did_doc::{DidDocument, Service};
+    use iroh::{EndpointAddr, RelayUrl};
+
     use super::*;
-    use iroh::Endpoint;
-    use iroh::protocol::Router;
 
-    /// Verifies that the ALPN constant has the expected value.
-    #[test]
-    fn alpn_value() {
-        assert_eq!(ALPN, b"/atproto/resolve/1");
-    }
-
-    /// Verifies that [`ResolveRequest`] serializes and deserializes correctly.
-    #[test]
-    fn request_roundtrip() {
-        let req = ResolveRequest::Handle {
-            handle: "alice.bsky.social".to_string(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: ResolveRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResolveRequest::Handle { handle } => assert_eq!(handle, "alice.bsky.social"),
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        let req = ResolveRequest::Did {
-            did: "did:plc:abc123".to_string(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: ResolveRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResolveRequest::Did { did } => assert_eq!(did, "did:plc:abc123"),
-            other => panic!("unexpected variant: {other:?}"),
+    fn make_doc_with_service(service_endpoint: &str) -> DidDocument {
+        DidDocument {
+            context: None,
+            id: "did:plc:test123".to_string(),
+            also_known_as: None,
+            verification_method: None,
+            service: Some(vec![Service {
+                id: SERVICE_ID.to_string(),
+                r#type: IROH_SERVICE_TYPE.to_string(),
+                service_endpoint: service_endpoint.to_string(),
+            }]),
         }
     }
 
-    /// Verifies that [`ResolveResponse`] serializes and deserializes correctly.
-    #[test]
-    fn response_roundtrip() {
-        let resp = ResolveResponse::Ok {
-            did: "did:plc:xyz".to_string(),
-            pds: "https://bsky.social".to_string(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: ResolveResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResolveResponse::Ok { did, pds } => {
-                assert_eq!(did, "did:plc:xyz");
-                assert_eq!(pds, "https://bsky.social");
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        let resp = ResolveResponse::Error {
-            message: "not found".to_string(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: ResolveResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ResolveResponse::Error { message } => assert_eq!(message, "not found"),
-            other => panic!("unexpected variant: {other:?}"),
-        }
+    fn dummy_node_id() -> iroh::EndpointId {
+        iroh::SecretKey::from([1u8; 32]).public()
     }
 
-    /// Integration test: spins up a local iroh server and client, sends a
-    /// resolution request that will fail (because the test handle does not
-    /// exist), and verifies that the error is propagated correctly.
-    #[tokio::test]
-    async fn local_request_error_propagation() {
-        // Build the server endpoint and protocol handler.
-        let server_ep = Endpoint::empty_builder().bind().await.unwrap();
-        let protocol = AtprotoProtocol::new(Default::default()).unwrap();
-        let router = Router::builder(server_ep).accept(ALPN, protocol).spawn();
-        let server_addr = router.endpoint().addr();
+    /// Verifies the service type and id constants.
+    #[test]
+    fn service_constants() {
+        assert_eq!(SERVICE_ID, "#iroh");
+        assert_eq!(IROH_SERVICE_TYPE, "IrohNode");
+    }
 
-        // Build the client endpoint.
-        let client_ep = Endpoint::empty_builder().bind().await.unwrap();
-        let client = AtprotoClient::new(client_ep);
+    /// Verifies that extract_iroh_addr works for a DID document that has an IrohNode service.
+    #[test]
+    fn extract_from_did_doc() {
+        let node_id = dummy_node_id();
+        let endpoint = format!("iroh://{node_id}");
+        let doc = make_doc_with_service(&endpoint);
+        let addr = resolver::extract_iroh_addr(&doc, "alice.example.com").unwrap();
+        assert_eq!(addr.id, node_id);
+    }
 
-        // Resolve a handle that doesn't exist — we expect an error to come back
-        // rather than a panic or a hang.
-        let result = client
-            .resolve_handle(&server_addr, "nonexistent.invalid")
-            .await;
-        assert!(
-            result.is_err(),
-            "expected an error for an unknown handle, got: {result:?}"
-        );
+    /// Verifies that extract_iroh_addr returns NoIrohService for a doc with no IrohNode service.
+    #[test]
+    fn extract_missing_service() {
+        let doc = DidDocument {
+            context: None,
+            id: "did:plc:test123".to_string(),
+            also_known_as: None,
+            verification_method: None,
+            service: None,
+        };
+        let err = resolver::extract_iroh_addr(&doc, "alice.example.com").unwrap_err();
+        assert!(matches!(err, Error::NoIrohService(_)));
+    }
 
-        router.shutdown().await.unwrap();
+    /// Verifies that a service with the wrong type is ignored.
+    #[test]
+    fn extract_wrong_service_type() {
+        let doc = DidDocument {
+            context: None,
+            id: "did:plc:test123".to_string(),
+            also_known_as: None,
+            verification_method: None,
+            service: Some(vec![atrium_api::did_doc::Service {
+                id: SERVICE_ID.to_string(),
+                r#type: "AtprotoPersonalDataServer".to_string(),
+                service_endpoint: "https://bsky.social".to_string(),
+            }]),
+        };
+        let err = resolver::extract_iroh_addr(&doc, "alice.example.com").unwrap_err();
+        assert!(matches!(err, Error::NoIrohService(_)));
+    }
+
+    /// Verifies the format/parse roundtrip with a relay URL.
+    #[test]
+    fn format_parse_roundtrip_with_relay() {
+        let node_id = dummy_node_id();
+        let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let addr = EndpointAddr::new(node_id).with_relay_url(relay.clone());
+        let endpoint = format_service_endpoint(&addr);
+        let parsed = parse_service_endpoint(&endpoint).unwrap();
+        assert_eq!(parsed.id, node_id);
+        let relays: Vec<_> = parsed.relay_urls().collect();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0], &relay);
     }
 }
